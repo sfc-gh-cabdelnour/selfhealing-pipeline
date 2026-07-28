@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="snowflake-source" content="cortex-agent-authored">
+<title>Self-Healing Pipeline — Deployment Guide</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, 'Segoe UI', sans-serif; color: #1f2937; line-height: 1.6; padding: 0; background: #fff; }
+.cover { background: linear-gradient(135deg, #0D2B45 0%, #11567F 60%, #29B5E8 100%); color: #fff; padding: 80px 60px 60px; page-break-after: always; }
+.cover h1 { font-size: 2.8em; margin-bottom: 12px; font-weight: 800; }
+.cover .subtitle { font-size: 1.3em; opacity: 0.9; margin-bottom: 40px; }
+.cover .meta { font-size: 0.95em; opacity: 0.8; margin-top: 8px; }
+.container { max-width: 900px; margin: 0 auto; padding: 40px 60px; }
+h2 { font-size: 1.6em; color: #0D2B45; margin-top: 40px; margin-bottom: 12px; border-left: 4px solid #29B5E8; padding-left: 14px; page-break-after: avoid; }
+h3 { font-size: 1.2em; color: #11567F; margin-top: 24px; margin-bottom: 8px; }
+h4 { font-size: 1.05em; color: #374151; margin-top: 16px; margin-bottom: 6px; }
+p, li { margin-bottom: 8px; }
+ul, ol { padding-left: 24px; margin-bottom: 14px; }
+code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 0.88em; font-family: 'SF Mono', Consolas, monospace; }
+pre { background: #0f172a; color: #e2e8f0; padding: 16px 20px; border-radius: 6px; overflow-x: auto; font-size: 0.82em; margin: 12px 0 20px; line-height: 1.5; }
+pre code { background: none; padding: 0; color: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 14px 0 20px; font-size: 0.9em; }
+th { background: #11567F; color: #fff; padding: 8px 12px; text-align: left; font-weight: 600; }
+td { padding: 7px 12px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }
+tr:nth-child(even) { background: #f8fafc; }
+.rationale { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 12px 16px; margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 0.9em; }
+.rationale strong { color: #1e40af; }
+.warning { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 0.9em; }
+.prereq { background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px; padding: 16px 20px; margin: 16px 0; }
+.prereq h4 { color: #166534; margin-top: 0; }
+@media print {
+  .cover { page-break-after: always; }
+  h2 { page-break-after: avoid; }
+  .rationale, pre { page-break-inside: avoid; }
+  body { font-size: 11pt; }
+}
+</style>
+</head>
+<body>
+
+<div class="cover">
+<h1>Self-Healing Data Pipeline</h1>
+<div class="subtitle">Deployment and Testing Guide</div>
+<div class="meta">For: Shai Leib, CA DHCS ETS Data Architect</div>
+<div class="meta">Author: Christian Abdel-Nour, Snowflake Solutions Delivery</div>
+<div class="meta">Date: July 28, 2026</div>
+<div class="meta" style="margin-top: 24px; opacity: 0.7;">Repo: github.com/sfc-gh-cabdelnour/selfhealing-pipeline</div>
+</div>
+
+<div class="container">
+
+<h2>1. What This Is</h2>
+
+<p>A Snowflake-native self-healing data pipeline that:</p>
+<ol>
+<li><strong>Detects</strong> when upstream BRONZE table schemas change (columns added, dropped, or type-changed)</li>
+<li><strong>Halts</strong> the pipeline to prevent broken data from propagating</li>
+<li><strong>Diagnoses</strong> the root cause using Cortex AI (claude-4-sonnet)</li>
+<li><strong>Regenerates</strong> downstream model SQL using Cortex LLM (llama3.1-70b)</li>
+<li><strong>Validates</strong> the fix by executing generated code against a zero-copy clone of production</li>
+<li><strong>Opens a GitHub PR</strong> with diagnosis + code + test results for human approval</li>
+</ol>
+
+<p>The entire system runs inside Snowflake — no external orchestrator, no Lambda, no Airflow.</p>
+
+<div class="rationale"><strong>Design Rationale — Why Snowflake-Native:</strong> Every component (Tasks, stored procedures, Cortex AI, CLONE, External Access Integration) is a first-party Snowflake feature. This means: no infrastructure to manage, no credential rotation for external CI tools, no network egress except the GitHub API call, and the same RBAC governs the pipeline as governs the data.</div>
+
+<h2>2. Prerequisites</h2>
+
+<div class="prereq">
+<h4>Required before deployment:</h4>
+<ul>
+<li><strong>Snowflake account</strong> with Enterprise edition or higher (for Cortex AI functions)</li>
+<li><strong>Snowflake CLI (<code>snow</code>)</strong> installed and configured with a connection to your account</li>
+<li><strong>ACCOUNTADMIN</strong> role access (or a role with CREATE DATABASE, CREATE ROLE, CREATE INTEGRATION privileges)</li>
+<li><strong>Cortex AI enabled</strong> in your region (verify: <code>SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b','test');</code>)</li>
+<li><strong>[Optional] GitHub PAT</strong> for PR automation (the pipeline works without it — PR step is skipped)</li>
+<li><strong>Git</strong> to clone the repository</li>
+</ul>
+</div>
+
+<div class="rationale"><strong>Design Rationale — ACCOUNTADMIN requirement:</strong> The pipeline creates databases, roles, and External Access Integrations — operations that require elevated privileges. In production, you'd create a dedicated admin role with only the required CREATE privileges. The foundation script creates SELFHEALING_ADMIN and SELFHEALING_EXECUTOR roles for least-privilege operation after initial setup.</div>
+
+<h2>3. Architecture</h2>
+
+<h3>Object Inventory (what gets created)</h3>
+
+<table>
+<tr><th>Schema</th><th>Object</th><th>Type</th><th>Purpose</th></tr>
+<tr><td>CONFIG</td><td>SCHEMA_REGISTRY</td><td>Table</td><td>Known-good schema baseline (what columns SHOULD exist)</td></tr>
+<tr><td>CONFIG</td><td>SCHEMA_CHANGE_EVENTS</td><td>Table</td><td>Detected drift events with lifecycle status</td></tr>
+<tr><td>CONFIG</td><td>PIPELINE_HEALTH_AUDIT</td><td>Table</td><td>Data quality findings + AI diagnosis</td></tr>
+<tr><td>CONFIG</td><td>PIPELINE_RUN_LOG</td><td>Table</td><td>Execution observability (when, how long, what happened)</td></tr>
+<tr><td>CONFIG</td><td>ARTIFACT_REGISTRY</td><td>Table</td><td>dbt model lineage graph (what depends on what)</td></tr>
+<tr><td>CONFIG</td><td>GENERATED_CODE</td><td>Table</td><td>LLM-regenerated SQL + validation results</td></tr>
+<tr><td>CONFIG</td><td>VW_ARTIFACT_LINEAGE</td><td>View</td><td>Recursive CTE: given a table, find all downstream models</td></tr>
+<tr><td>CONFIG</td><td>SP_SCHEMA_DRIFT_DETECTOR</td><td>Procedure</td><td>Compares INFORMATION_SCHEMA vs registry</td></tr>
+<tr><td>CONFIG</td><td>SP_HALT_GATE</td><td>Procedure</td><td>Blocks pipeline on unresolved issues</td></tr>
+<tr><td>CONFIG</td><td>FN_DIAGNOSE_FAILURE</td><td>Function</td><td>Cortex AI root cause analysis</td></tr>
+<tr><td>CONFIG</td><td>SP_GENERATE_ARTIFACT_CODE</td><td>Procedure (Python)</td><td>LLM code regeneration</td></tr>
+<tr><td>CONFIG</td><td>SP_VALIDATE_GENERATED_CODE</td><td>Procedure (Python)</td><td>Clone + execute + report</td></tr>
+<tr><td>CONFIG</td><td>TASK_SELF_HEALING_PIPELINE</td><td>Task</td><td>Scheduled execution (15 min, suspended by default)</td></tr>
+<tr><td>BRONZE</td><td>CUSTOMERS, ORDERS, ORDER_ITEMS</td><td>Tables</td><td>Demo source data</td></tr>
+<tr><td>SILVER</td><td>ORDERS, ORDER_ITEMS</td><td>Views</td><td>Cleansed/normalized layer</td></tr>
+<tr><td>GOLD</td><td>ORDERS_DAILY, CATEGORY_SUMMARY</td><td>Tables</td><td>Aggregate/reporting layer</td></tr>
+</table>
+
+<div class="rationale"><strong>Design Rationale — Separation of CONFIG schema:</strong> All pipeline infrastructure lives in CONFIG, completely separate from the data layers (BRONZE/SILVER/GOLD). This means: (1) the pipeline can be dropped without affecting data, (2) grants can be scoped differently (operators get CONFIG access, analysts get GOLD read-only), (3) the pattern is portable — drop CONFIG into any database.</div>
+
+<h2>4. Deployment Steps</h2>
+
+<h3>Step 1: Clone the repository</h3>
+
+<pre><code>git clone https://github.com/sfc-gh-cabdelnour/selfhealing-pipeline.git
+cd selfhealing-pipeline</code></pre>
+
+<h3>Step 2: Set your Snowflake connection</h3>
+
+<pre><code># If using Snowflake CLI:
+export SNOWFLAKE_CONNECTION=your-connection-name
+
+# Verify connectivity:
+snow sql -c $SNOWFLAKE_CONNECTION -q "SELECT CURRENT_ACCOUNT(), CURRENT_ROLE();"</code></pre>
+
+<h3>Step 3: Deploy foundation (roles, database, schemas, tables)</h3>
+
+<pre><code>snow sql -c $SNOWFLAKE_CONNECTION -f config/01_foundation.sql</code></pre>
+
+<p>This creates:</p>
+<ul>
+<li>Roles: <code>SELFHEALING_ADMIN</code>, <code>SELFHEALING_EXECUTOR</code></li>
+<li>Database: <code>SELFHEALING_PROD</code> with 4 schemas</li>
+<li>Warehouse: <code>SELFHEALING_WH</code> (XSMALL, auto-suspend 60s)</li>
+<li>All 7 CONFIG tables with constraints and retention policies</li>
+</ul>
+
+<div class="rationale"><strong>Design Rationale — CREATE IF NOT EXISTS everywhere:</strong> The foundation script is idempotent. Running it twice does nothing harmful. This is critical for operational safety — if someone accidentally re-runs deployment, it won't drop existing data. Compare to <code>CREATE OR REPLACE</code> which would destroy everything.</div>
+
+<div class="rationale"><strong>Design Rationale — DATA_RETENTION_TIME_IN_DAYS:</strong> Event and audit tables have 30-90 day retention. This enables Time Travel for recovery and ensures old resolved events are garbage-collected automatically. Without this, tables grow indefinitely.</div>
+
+<h3>Step 4: Deploy detection procedures</h3>
+
+<pre><code>snow sql -c $SNOWFLAKE_CONNECTION -f config/02_detection.sql</code></pre>
+
+<div class="rationale"><strong>Design Rationale — Detection via INFORMATION_SCHEMA diff:</strong> We compare the live schema (INFORMATION_SCHEMA.COLUMNS) against a stored baseline (SCHEMA_REGISTRY). This is pure SQL — no external catalog, no Horizon integration required. It catches: new columns, dropped columns, and data type changes. The detector is idempotent: running it 10 times with no schema change produces zero events.</div>
+
+<h3>Step 5: Deploy diagnosis + halt gate</h3>
+
+<pre><code>snow sql -c $SNOWFLAKE_CONNECTION -f config/03_diagnosis.sql</code></pre>
+
+<div class="rationale"><strong>Design Rationale — TRY_PARSE_JSON fallback:</strong> The AI diagnosis function uses <code>TRY_PARSE_JSON</code> instead of <code>PARSE_JSON</code>. If the LLM returns malformed JSON (it happens ~5% of the time), the function returns a safe fallback object instead of crashing the entire pipeline. Production-grade error handling.</div>
+
+<div class="rationale"><strong>Design Rationale — Halt gate as separate procedure:</strong> The gate is a standalone check that any pipeline step can call. Want to add it to your existing ingestion pipeline? Just add <code>CALL SP_HALT_GATE();</code> at the top of your ingestion stored procedure and check for 'HALTED' in the return value. The gate doesn't know or care about the rest of the self-healing logic.</div>
+
+<h3>Step 6: Deploy lineage + code generation</h3>
+
+<pre><code>snow sql -c $SNOWFLAKE_CONNECTION -f config/04_lineage_codegen.sql</code></pre>
+
+<div class="rationale"><strong>Design Rationale — VW_ARTIFACT_LINEAGE as a view:</strong> The recursive CTE is defined once as a view and queried by all downstream procedures. This eliminates code duplication (the original version had the same CTE copy-pasted in 2 places). The view is always current — any change to ARTIFACT_REGISTRY is immediately reflected.</div>
+
+<div class="rationale"><strong>Design Rationale — Python for code generation:</strong> We use a Python stored procedure for the codegen loop because Snowflake SQL Scripting has limitations with cursor variable binding inside FOR loops (cursor row fields like <code>rec.COLUMN_NAME</code> are inconsistently accessible). Python with Snowpark gives us reliable iteration, proper error handling, and cleaner Cortex integration. The tradeoff: Python procs have ~2s cold-start overhead vs SQL procs. Acceptable for a 15-minute scheduled task.</div>
+
+<div class="rationale"><strong>Design Rationale — Idempotent code generation:</strong> The procedure checks <code>if session.table(...).filter(...).count() > 0: continue</code> before generating. If the task runs twice for the same event, it skips already-generated artifacts. This prevents duplicate rows in GENERATED_CODE and wasted Cortex credits.</div>
+
+<h3>Step 7: Deploy GitHub integration (optional)</h3>
+
+<pre><code># Only if you have a GitHub PAT and want PR automation:
+# First, create the secret (run in Snowsight):
+#   CREATE OR REPLACE SECRET SELFHEALING_PROD.CONFIG.GITHUB_PAT_SECRET
+#     TYPE = GENERIC_STRING SECRET_STRING = 'ghp_yourPAThere';
+
+snow sql -c $SNOWFLAKE_CONNECTION -f config/05_github_eai.sql</code></pre>
+
+<div class="warning"><strong>Note:</strong> The pipeline works without the GitHub integration. If you skip this step, the pipeline still detects, diagnoses, generates code, and validates — you just won't get automated PRs. Review generated code directly in the GENERATED_CODE table.</div>
+
+<div class="rationale"><strong>Design Rationale — External Access Integration (EAI):</strong> EAI is the only way for Snowflake to make outbound HTTP calls (to GitHub's API). It requires an explicit network rule (only api.github.com:443 is allowed) and an authentication secret. This is the most locked-down approach — no broad internet access, no wildcard rules, no long-lived tokens stored in code.</div>
+
+<h3>Step 8: Deploy validation</h3>
+
+<pre><code>snow sql -c $SNOWFLAKE_CONNECTION -f config/06_validation.sql</code></pre>
+
+<div class="rationale"><strong>Design Rationale — Zero-copy clone for testing:</strong> <code>CREATE DATABASE ... CLONE</code> creates an instant, full-fidelity copy of production with zero storage cost (copy-on-write). We execute generated SQL against this clone to prove it works against real data structures. The clone is dropped immediately after validation to prevent storage accumulation. Total cost: ~0.001 credits per validation cycle.</div>
+
+<h3>Step 9: Deploy orchestrator + task</h3>
+
+<pre><code>snow sql -c $SNOWFLAKE_CONNECTION -f config/07_pipeline_tasks.sql</code></pre>
+
+<div class="rationale"><strong>Design Rationale — Task suspended by default:</strong> The scheduled task starts in SUSPENDED state. You must explicitly <code>ALTER TASK ... RESUME</code> to activate automated execution. This prevents unintended pipeline runs during deployment or testing. Resume only when you're confident the system is working correctly.</div>
+
+<h3>Step 10: Seed demo data</h3>
+
+<pre><code>snow sql -c $SNOWFLAKE_CONNECTION -f config/08_seed_demo.sql</code></pre>
+
+<p>This populates BRONZE tables, creates SILVER/GOLD models, seeds the schema registry baseline, and registers the artifact lineage graph.</p>
+
+<h2>5. Testing the Deployment</h2>
+
+<h3>Test 1: Verify all objects exist</h3>
+
+<pre><code>-- Should return 7 CONFIG tables + 1 view
+SELECT TABLE_NAME, TABLE_TYPE FROM SELFHEALING_PROD.INFORMATION_SCHEMA.TABLES 
+WHERE TABLE_SCHEMA = 'CONFIG' ORDER BY TABLE_TYPE, TABLE_NAME;
+
+-- Should return 5 procedures + 1 function
+SHOW PROCEDURES IN SCHEMA SELFHEALING_PROD.CONFIG;
+SHOW USER FUNCTIONS IN SCHEMA SELFHEALING_PROD.CONFIG;</code></pre>
+
+<h3>Test 2: Simulate schema drift end-to-end</h3>
+
+<pre><code>USE SCHEMA SELFHEALING_PROD.CONFIG;
+
+-- Simulate column addition
+ALTER TABLE SELFHEALING_PROD.BRONZE.ORDERS ADD COLUMN LOYALTY_POINTS NUMBER;
+
+-- Detect
+CALL SP_SCHEMA_DRIFT_DETECTOR();
+-- Expected: NEW=1
+
+-- Halt
+CALL SP_HALT_GATE();
+-- Expected: HALTED — 0 critical, 1 pending
+
+-- Get event ID
+SET eid = (SELECT EVENT_ID FROM SCHEMA_CHANGE_EVENTS WHERE PIPELINE_STATUS='PENDING' LIMIT 1);
+
+-- Generate code (takes 30-60 seconds for Cortex)
+CALL SP_GENERATE_ARTIFACT_CODE($eid);
+-- Expected: Generated 1 artifacts
+
+-- Validate
+CALL SP_VALIDATE_GENERATED_CODE($eid);
+-- Expected: PASS=0 FAIL=1 (GOLD aggregate model can't auto-resolve)
+
+-- Check results
+SELECT ARTIFACT_NAME, TEST_STATUS, LEFT(TEST_ERROR, 100) FROM GENERATED_CODE WHERE EVENT_ID = $eid;</code></pre>
+
+<h3>Test 3: Verify idempotency</h3>
+
+<pre><code>-- Run detector again — should find 0 new events (already tracked)
+CALL SP_SCHEMA_DRIFT_DETECTOR();
+-- Expected: NEW=0
+
+-- Run codegen again — should skip (already generated)
+CALL SP_GENERATE_ARTIFACT_CODE($eid);
+-- Expected: Generated 0 artifacts</code></pre>
+
+<h3>Test 4: Clean up and re-test (full teardown/rebuild)</h3>
+
+<pre><code>-- Teardown
+DROP DATABASE IF EXISTS SELFHEALING_PROD;
+DROP DATABASE IF EXISTS SELFHEALING_DEV;
+DROP WAREHOUSE IF EXISTS SELFHEALING_WH;
+DROP ROLE IF EXISTS SELFHEALING_EXECUTOR;
+DROP ROLE IF EXISTS SELFHEALING_ADMIN;
+
+-- Rebuild: re-run Steps 3-10 above
+-- Then re-run Test 2
+-- Results should be identical (deterministic)</code></pre>
+
+<h2>6. Adapting for Your Environment</h2>
+
+<h3>To use with your existing dbt project:</h3>
+
+<ol>
+<li><strong>Populate ARTIFACT_REGISTRY</strong> with your real model graph. Each row = one model + what it depends on. You can generate this from <code>dbt ls --output json</code>.</li>
+<li><strong>Seed GENERATED_CODE baseline</strong> with the current SQL for each model. This gives the LLM context for regeneration.</li>
+<li><strong>Point SCHEMA_REGISTRY</strong> at your actual BRONZE schema: <code>INSERT INTO SCHEMA_REGISTRY SELECT ... FROM YOUR_DB.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = 'BRONZE'</code>.</li>
+<li><strong>Update the VW_ARTIFACT_LINEAGE view</strong> if your lineage has more than 2 hops (adjust the DEPTH limit in the recursive CTE).</li>
+</ol>
+
+<div class="rationale"><strong>Design Rationale — Decoupled from dbt:</strong> The pipeline doesn't require dbt to run. It operates on plain SQL and a metadata table (ARTIFACT_REGISTRY) that describes the lineage graph. If you use dbt, populate the registry from the manifest. If you use stored procedures, populate it manually. If you use Dynamic Tables, populate it from SHOW DYNAMIC TABLES dependencies. The pattern is framework-agnostic.</div>
+
+<h3>To integrate the halt gate into existing pipelines:</h3>
+
+<pre><code>-- Add this to the TOP of any ingestion stored procedure:
+DECLARE v_gate VARCHAR;
+BEGIN
+    CALL SELFHEALING_PROD.CONFIG.SP_HALT_GATE() INTO v_gate;
+    IF (LEFT(v_gate, 6) = 'HALTED') THEN
+        -- Log and exit without processing
+        RETURN 'Pipeline blocked: ' || v_gate;
+    END IF;
+    -- ... rest of your ingestion logic ...
+END;</code></pre>
+
+<h2>7. Design Decision Summary</h2>
+
+<table>
+<tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+<tr><td>Language for detection</td><td>SQL</td><td>Pure set operations on INFORMATION_SCHEMA — no iteration needed, fastest cold-start</td></tr>
+<tr><td>Language for codegen/validation</td><td>Python (Snowpark)</td><td>Reliable cursor iteration, proper error handling, cleaner Cortex integration</td></tr>
+<tr><td>LLM for diagnosis</td><td>claude-4-sonnet</td><td>Best reasoning capability for root cause analysis with structured output</td></tr>
+<tr><td>LLM for code generation</td><td>llama3.1-70b</td><td>Good SQL generation, lower cost, sufficient for mechanical rewrites</td></tr>
+<tr><td>Lineage storage</td><td>Table + recursive view</td><td>SQL-native, no external manifest parsing, always current</td></tr>
+<tr><td>Validation approach</td><td>Zero-copy clone + execute</td><td>Tests against real data structures at zero storage cost</td></tr>
+<tr><td>Human gate</td><td>PR-first (GitHub EAI)</td><td>Every change is auditable, reviewable, and reversible via standard git workflow</td></tr>
+<tr><td>Scheduling</td><td>Snowflake Task (15 min)</td><td>Native, no external scheduler, auto-suspend warehouse between runs</td></tr>
+<tr><td>Idempotency</td><td>Skip-if-exists on all writes</td><td>Safe for re-execution after transient failures without duplicating work</td></tr>
+<tr><td>Error handling</td><td>TRY_PARSE_JSON + Python try/except</td><td>Graceful degradation — pipeline logs errors but doesn't crash on LLM issues</td></tr>
+</table>
+
+<h2>8. Troubleshooting</h2>
+
+<table>
+<tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+<tr><td>SP_GENERATE_ARTIFACT_CODE returns "No downstream for TABLE"</td><td>ARTIFACT_REGISTRY missing entry for that table</td><td>Insert the lineage row: <code>INSERT INTO ARTIFACT_REGISTRY VALUES ('MODEL','SCHEMA','path','TABLE','TABLE',CURRENT_TIMESTAMP())</code></td></tr>
+<tr><td>FN_DIAGNOSE_FAILURE returns fallback JSON (confidence: 0.0)</td><td>Cortex returned malformed response</td><td>Check Cortex availability: <code>SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-4-sonnet','test');</code> — may be region-limited or rate-limited</td></tr>
+<tr><td>SP_VALIDATE_GENERATED_CODE returns "Clone failed"</td><td>Insufficient privileges to clone database</td><td>Ensure running as ACCOUNTADMIN or role with CREATE DATABASE privilege</td></tr>
+<tr><td>Detector finds 0 changes after ALTER TABLE</td><td>Event already exists for that column (idempotency guard)</td><td>Check SCHEMA_CHANGE_EVENTS for existing PENDING entry. Resolve or delete it first.</td></tr>
+<tr><td>GitHub PR fails with 401</td><td>PAT expired or insufficient scope</td><td>Regenerate PAT with <code>repo</code> scope. Update secret: <code>ALTER SECRET ... SET SECRET_STRING = '...'</code></td></tr>
+</table>
+
+<h2>9. Credits and References</h2>
+
+<ul>
+<li><strong>Pattern origin:</strong> Tim Buchhorn (Snowflake SE, APJ) — <a href="https://github.com/sfc-gh-tbuchhorn/selfhealing-demo">selfhealing-demo</a> (detection + lineage + dbt integration)</li>
+<li><strong>Enhancements:</strong> Christian Abdel-Nour (Snowflake SD) — halt gate, AI diagnosis with confidence scoring, health checks beyond schema drift, production hardening (idempotency, TRY_PARSE_JSON, custom roles, retention policies)</li>
+<li><strong>Cortex AI best practices:</strong> SKE Confluence — "Start with capable models for baseline, optimize for cost"</li>
+</ul>
+
+</div>
+</body>
+</html>

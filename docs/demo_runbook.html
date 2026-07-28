@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="snowflake-source" content="cortex-agent-authored">
+<title>Self-Healing Pipeline — Demo Runbook</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, 'Segoe UI', sans-serif; color: #1f2937; line-height: 1.6; padding: 0; background: #fff; }
+.cover { background: linear-gradient(135deg, #0D2B45 0%, #11567F 60%, #29B5E8 100%); color: #fff; padding: 80px 60px 60px; page-break-after: always; }
+.cover h1 { font-size: 2.8em; margin-bottom: 12px; font-weight: 800; }
+.cover .subtitle { font-size: 1.3em; opacity: 0.9; margin-bottom: 40px; }
+.cover .meta { font-size: 0.95em; opacity: 0.8; margin-top: 8px; }
+.container { max-width: 900px; margin: 0 auto; padding: 40px 60px; }
+h2 { font-size: 1.6em; color: #0D2B45; margin-top: 40px; margin-bottom: 12px; border-left: 4px solid #29B5E8; padding-left: 14px; page-break-after: avoid; }
+h3 { font-size: 1.2em; color: #11567F; margin-top: 24px; margin-bottom: 8px; }
+h4 { font-size: 1.05em; color: #374151; margin-top: 16px; margin-bottom: 6px; }
+p, li { margin-bottom: 8px; }
+ul, ol { padding-left: 24px; margin-bottom: 14px; }
+code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 0.88em; font-family: 'SF Mono', Consolas, monospace; }
+pre { background: #0f172a; color: #e2e8f0; padding: 16px 20px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; margin: 12px 0 20px; line-height: 1.5; }
+pre code { background: none; padding: 0; color: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 14px 0 20px; font-size: 0.9em; }
+th { background: #11567F; color: #fff; padding: 8px 12px; text-align: left; font-weight: 600; }
+td { padding: 7px 12px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }
+tr:nth-child(even) { background: #f8fafc; }
+.rationale { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 12px 16px; margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 0.9em; }
+.rationale strong { color: #1e40af; }
+.step-box { background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px; padding: 16px 20px; margin: 16px 0; }
+.step-box h4 { color: #166534; margin-top: 0; }
+.warning { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 0.9em; }
+.arch-diagram { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; margin: 16px 0; font-family: 'SF Mono', monospace; font-size: 0.82em; white-space: pre; line-height: 1.4; }
+.duration { display: inline-block; background: #dbeafe; color: #1e40af; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; font-weight: 600; margin-left: 8px; }
+@media print {
+  .cover { page-break-after: always; }
+  h2 { page-break-after: avoid; }
+  .step-box, .rationale, pre { page-break-inside: avoid; }
+  body { font-size: 11pt; }
+}
+</style>
+</head>
+<body>
+
+<div class="cover">
+<h1>Self-Healing Data Pipeline</h1>
+<div class="subtitle">Demo Runbook — Sprint Review Presentation</div>
+<div class="meta">Presenter: Christian Abdel-Nour, Solutions Architect</div>
+<div class="meta">Audience: ETS Development Team (Sean, Shai, Zhijing, Ken)</div>
+<div class="meta">Date: July 28, 2026</div>
+<div class="meta" style="margin-top: 24px; opacity: 0.7;">Duration: ~15 minutes | Repo: github.com/sfc-gh-cabdelnour/selfhealing-pipeline</div>
+</div>
+
+<div class="container">
+
+<h2>1. Demo Narrative</h2>
+
+<p>This demo shows a Snowflake-native self-healing pipeline that automatically detects when upstream data sources change their schema, diagnoses the root cause using Cortex AI, regenerates downstream model SQL, and validates the fix against a zero-copy clone of production — all before a human reviews and merges.</p>
+
+<h3>Key Message for the Audience</h3>
+<p>"When a source system drops, adds, or changes a column, your pipeline doesn't break silently at 2am. It catches the change, explains why it happened, proposes a fix, tests it, and asks a human to approve — all within Snowflake."</p>
+
+<div class="rationale"><strong>Design Rationale:</strong> The human-in-the-loop gate exists because LLMs can regenerate SQL correctly for simple pass-through models (SILVER), but cannot infer aggregation intent in GOLD models. The demo deliberately shows a CI_FAILED result to prove why the gate matters.</div>
+
+<h2>2. Architecture Overview</h2>
+
+<div class="arch-diagram">Source Change (DDL: ALTER TABLE ADD COLUMN)
+    |
+    v
+[1] SCHEMA_DRIFT_DETECTOR ---- compares INFORMATION_SCHEMA vs SCHEMA_REGISTRY
+    |
+    v
+[2] HALT GATE --------------- blocks pipeline if PENDING events exist
+    |
+    v
+[3] FN_DIAGNOSE_FAILURE ----- Cortex AI (claude-4-sonnet) root cause analysis
+    |
+    v
+[4] VW_ARTIFACT_LINEAGE ----- recursive CTE: which models are affected?
+    |
+    v
+[5] SP_GENERATE_ARTIFACT_CODE  Cortex LLM (llama3.1-70b) regenerates SQL
+    |
+    v
+[6] SP_VALIDATE_GENERATED_CODE zero-copy clone + execute = PASS/FAIL
+    |
+    v
+[7] GitHub PR (EAI) --------- opens PR with diagnosis + code + test results
+    |
+    v
+    HUMAN REVIEWS & MERGES</div>
+
+<h2>3. Pre-Demo Checklist</h2>
+
+<div class="step-box">
+<h4>Before presenting, verify:</h4>
+<ol>
+<li>Snowflake session active: <code>USE ROLE ACCOUNTADMIN; USE WAREHOUSE SELFHEALING_WH;</code></li>
+<li>Database exists: <code>SHOW DATABASES LIKE 'SELFHEALING_PROD';</code></li>
+<li>Schema registry is populated: <code>SELECT COUNT(*) FROM SELFHEALING_PROD.CONFIG.SCHEMA_REGISTRY;</code> (should be ~15-19 rows)</li>
+<li>No pending events: <code>SELECT COUNT(*) FROM SELFHEALING_PROD.CONFIG.SCHEMA_CHANGE_EVENTS WHERE PIPELINE_STATUS = 'PENDING';</code> (should be 0)</li>
+<li>Baseline SQL exists: <code>SELECT COUNT(*) FROM SELFHEALING_PROD.CONFIG.GENERATED_CODE WHERE EVENT_ID = 'BASELINE';</code> (should be >= 1)</li>
+</ol>
+</div>
+
+<div class="warning"><strong>If the environment is not clean:</strong> Run the teardown + build from config scripts 01 through 08 (takes ~2 minutes). See Section 7 for the full reset procedure.</div>
+
+<h2>4. Demo Script — Step by Step</h2>
+
+<h3>Step 1: Show the current healthy state <span class="duration">1 min</span></h3>
+
+<p>Talk track: "Here's our production pipeline — 3 BRONZE tables, SILVER views, and 2 GOLD aggregate tables. Everything is stable."</p>
+
+<pre><code>-- Show the pipeline objects
+SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE 
+FROM SELFHEALING_PROD.INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA IN ('BRONZE','SILVER','GOLD')
+ORDER BY TABLE_SCHEMA, TABLE_NAME;
+
+-- Show the schema registry baseline
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE 
+FROM SELFHEALING_PROD.CONFIG.SCHEMA_REGISTRY
+WHERE TABLE_NAME = 'ORDERS'
+ORDER BY ORDINAL_POSITION;
+
+-- Show lineage graph
+SELECT * FROM SELFHEALING_PROD.CONFIG.VW_ARTIFACT_LINEAGE;</code></pre>
+
+<div class="rationale"><strong>Design Rationale — Schema Registry:</strong> We maintain a "known-good" baseline of what the BRONZE schema looked like when everything was working. This avoids diffing against stale metadata or external catalogs. The registry advances only after a human merges the fix.</div>
+
+<h3>Step 2: Simulate an upstream schema change <span class="duration">30 sec</span></h3>
+
+<p>Talk track: "A source system just added a new column — maybe a vendor added a discount code to their API, or Finance added a field to their Excel workbook."</p>
+
+<pre><code>-- Simulate: source system adds a column
+ALTER TABLE SELFHEALING_PROD.BRONZE.ORDERS ADD COLUMN DISCOUNT_CODE VARCHAR;
+
+-- Verify it's there
+DESCRIBE TABLE SELFHEALING_PROD.BRONZE.ORDERS;</code></pre>
+
+<div class="rationale"><strong>Design Rationale — Why ALTER TABLE and not Openflow CDC:</strong> In production, this would happen automatically via Openflow connectors detecting source schema changes. For demo purposes, we simulate with DDL. The pipeline is source-agnostic — it only cares about the diff between INFORMATION_SCHEMA and the registry.</div>
+
+<h3>Step 3: Run the drift detector <span class="duration">1 min</span></h3>
+
+<p>Talk track: "The detector runs every 15 minutes on a scheduled task. Let's trigger it manually."</p>
+
+<pre><code>USE SCHEMA SELFHEALING_PROD.CONFIG;
+CALL SP_SCHEMA_DRIFT_DETECTOR();
+
+-- See the detected event
+SELECT EVENT_ID, CHANGE_TYPE, TABLE_NAME, COLUMN_NAME, PIPELINE_STATUS
+FROM SCHEMA_CHANGE_EVENTS;</code></pre>
+
+<p>Expected output: <code>NEW_COLUMN | ORDERS | DISCOUNT_CODE | PENDING</code></p>
+
+<div class="rationale"><strong>Design Rationale — Idempotent Detection:</strong> The detector only inserts events that don't already have a PENDING/CODE_GENERATED/PR_OPEN entry for the same table+column+type. This means re-running it (e.g., if the task fires twice) never creates duplicates.</div>
+
+<h3>Step 4: Demonstrate the halt gate <span class="duration">30 sec</span></h3>
+
+<p>Talk track: "Before any pipeline refresh can proceed, we check the gate. It's blocked."</p>
+
+<pre><code>CALL SP_HALT_GATE();</code></pre>
+
+<p>Expected: <code>HALTED — 0 critical, 1 pending</code></p>
+
+<div class="rationale"><strong>Design Rationale — Halt Gate:</strong> This is Shai's explicit ask: "detect schema drift in real time, halt ingestion." The gate ensures no stale or broken data propagates downstream while a schema change is unresolved. It checks both schema drift events AND data quality findings — either can block the pipeline.</div>
+
+<h3>Step 5: Run code generation <span class="duration">2-3 min</span></h3>
+
+<p>Talk track: "Now we ask Cortex AI to regenerate the impacted models. First it walks the lineage graph to find what's downstream, then it regenerates each model's SQL."</p>
+
+<pre><code>-- Get the event ID
+SET eid = (SELECT EVENT_ID FROM SCHEMA_CHANGE_EVENTS WHERE PIPELINE_STATUS='PENDING' LIMIT 1);
+
+-- Show what will be impacted (lineage traversal)
+SELECT * FROM VW_ARTIFACT_LINEAGE WHERE CHANGED_TABLE = 'ORDERS';
+
+-- Generate code (calls Cortex llama3.1-70b)
+CALL SP_GENERATE_ARTIFACT_CODE($eid);
+
+-- Show what was generated
+SELECT ARTIFACT_NAME, ARTIFACT_SCHEMA, LEFT(GENERATED_SQL, 200) AS SQL_PREVIEW
+FROM GENERATED_CODE
+WHERE EVENT_ID = $eid;</code></pre>
+
+<div class="rationale"><strong>Design Rationale — Two-Model LLM Strategy:</strong> We use <code>claude-4-sonnet</code> for diagnosis (needs strong reasoning to explain root cause) and <code>llama3.1-70b</code> for code generation (needs speed and low cost for SQL rewriting). This matches Snowflake's Cortex best practices: "Start with capable models for baseline, then optimize for cost."</div>
+
+<div class="rationale"><strong>Design Rationale — Recursive CTE Lineage:</strong> We use a recursive CTE over ARTIFACT_REGISTRY rather than parsing dbt manifest JSON. This keeps the entire system SQL-native with zero external dependencies. The lineage traversal finds ALL downstream models — not just direct dependents — so a BRONZE change correctly propagates through SILVER to GOLD.</div>
+
+<h3>Step 6: Validate against a zero-copy clone <span class="duration">1-2 min</span></h3>
+
+<p>Talk track: "Before we trust the generated code, we test it. We create a zero-copy clone of production (zero cost, instant), execute the generated SQL against it, and record pass/fail per model."</p>
+
+<pre><code>CALL SP_VALIDATE_GENERATED_CODE($eid);
+
+-- Check results
+SELECT ARTIFACT_NAME, TEST_STATUS, LEFT(TEST_ERROR, 100) AS ERROR
+FROM GENERATED_CODE
+WHERE EVENT_ID = $eid;
+
+-- Check event final status
+SELECT PIPELINE_STATUS FROM SCHEMA_CHANGE_EVENTS WHERE EVENT_ID = $eid;</code></pre>
+
+<p>Expected: <code>ORDERS_DAILY | FAIL</code> and status = <code>CI_FAILED</code></p>
+
+<div class="rationale"><strong>Design Rationale — Zero-Copy Clone:</strong> Snowflake's CLONE creates an instant, full-fidelity copy of production at zero storage cost (until modified). This means we test generated code against real data structures without touching production. The clone is dropped after validation to prevent storage accumulation.</div>
+
+<h3>Step 7: Explain WHY it failed <span class="duration">2 min</span></h3>
+
+<p>Talk track: "The GOLD model failed because it's an aggregate query (GROUP BY ORDER_DATE). The LLM added DISCOUNT_CODE to the SELECT but didn't know whether to GROUP BY it or aggregate it — because that's a business decision. This is exactly why we have the human gate."</p>
+
+<pre><code>-- Show the generated SQL that failed
+SELECT GENERATED_SQL FROM GENERATED_CODE WHERE EVENT_ID = $eid AND ARTIFACT_NAME = 'ORDERS_DAILY';
+
+-- The issue: DISCOUNT_CODE in SELECT without GROUP BY
+-- A human would decide: add to GROUP BY? Or COUNT(DISTINCT DISCOUNT_CODE)?
+-- Or maybe exclude from this aggregate entirely?</code></pre>
+
+<div class="rationale"><strong>Design Rationale — Why CI_FAILED is the RIGHT demo outcome:</strong> If everything passed, the audience might think "why do we need humans?" The failure demonstrates that AI handles mechanical changes (pass-through columns in SILVER) perfectly, but cannot infer business intent for aggregations. The PR-first pattern ensures a human makes that decision — not the machine.</div>
+
+<h3>Step 8: Show the complete audit trail <span class="duration">1 min</span></h3>
+
+<p>Talk track: "Everything is logged. The detection, the generated code, the test results. In production, this would also include a GitHub PR with the diagnosis and proposed fix attached."</p>
+
+<pre><code>-- Full event lifecycle
+SELECT EVENT_ID, CHANGE_TYPE, TABLE_NAME, COLUMN_NAME, PIPELINE_STATUS, DETECTED_AT
+FROM SCHEMA_CHANGE_EVENTS;
+
+-- Generated code archive
+SELECT EVENT_ID, ARTIFACT_NAME, TEST_STATUS, GENERATED_AT
+FROM GENERATED_CODE WHERE EVENT_ID != 'BASELINE';</code></pre>
+
+<h2>5. Q&A Preparation</h2>
+
+<table>
+<tr><th>Likely Question</th><th>Answer</th></tr>
+<tr><td>"What if the LLM generates wrong SQL that still compiles?"</td><td>The validation catches syntax errors, but not semantic errors. That's why we always require human review of the PR. The test proves it compiles and runs — correctness is the human's job.</td></tr>
+<tr><td>"Can this auto-merge if the test passes?"</td><td>Architecturally yes — remove the human gate. But we deliberately chose not to because even passing code can have wrong business logic (e.g., a new column that should be excluded from an aggregate).</td></tr>
+<tr><td>"How does this handle multiple simultaneous changes?"</td><td>Events are processed one at a time (LIMIT 1). Sequential processing avoids stale-branch conflicts. If multiple changes accumulate, they queue and are handled in order.</td></tr>
+<tr><td>"What about column renames?"</td><td>A rename shows as COLUMN_DROP + NEW_COLUMN (two events, two PRs). We don't correlate them automatically — that's a known limitation documented in the README.</td></tr>
+<tr><td>"Does this work with dbt?"</td><td>Yes — in the full version, generated SQL is committed to the dbt project and validated via EXECUTE DBT PROJECT against a clone. The demo uses direct SQL for simplicity.</td></tr>
+<tr><td>"Can this handle data quality issues, not just schema drift?"</td><td>Yes — the PIPELINE_HEALTH_AUDIT table also captures null FK rates, duplicate surrogate keys, and orphan foreign keys. Same halt gate pattern. The demo focuses on schema drift because it's the most visual.</td></tr>
+</table>
+
+<h2>6. Closing Statement</h2>
+
+<p>Talk track: "This is a spike — a working proof of concept deployed on our sandbox in under 3 hours. The pattern is Snowflake-native (no external orchestrator, no Lambda, no Airflow), uses existing Cortex AI capabilities, and integrates with GitHub for change management. If the team wants this on the customer environment, it's an afternoon of adaptation work — the logic is identical, just pointed at different source tables."</p>
+
+<h2>7. Reset Procedure (Between Demos)</h2>
+
+<p>If you need to reset the environment to a clean state for a second demo:</p>
+
+<pre><code>-- Drop everything
+DROP DATABASE IF EXISTS SELFHEALING_PROD;
+DROP DATABASE IF EXISTS SELFHEALING_DEV;
+
+-- Rebuild (run the full deploy sequence)
+-- This takes ~2 minutes including Cortex model warmup</code></pre>
+
+<p>Then re-run Steps 1-8 from a fresh slate. The pipeline is fully idempotent — teardown and rebuild produce identical results every time (validated with 2 full cycles).</p>
+
+</div>
+</body>
+</html>
