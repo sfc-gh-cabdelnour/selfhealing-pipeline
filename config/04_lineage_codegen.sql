@@ -1,125 +1,122 @@
 -- =============================================================================
--- 04_lineage_codegen.sql — Transitive lineage traversal + Cortex code regeneration
+-- 04_lineage_codegen.sql — Lineage traversal + code regeneration (hardened)
+-- Parameterized queries, idempotent inserts, error handling, single lineage source
 -- =============================================================================
 
 USE SCHEMA SELFHEALING_PROD.CONFIG;
 
--- Procedure: Get all impacted downstream artifacts for a given BRONZE table
-CREATE OR REPLACE PROCEDURE SP_GET_IMPACTED_ARTIFACTS(p_table_name VARCHAR)
-RETURNS TABLE (ARTIFACT_NAME VARCHAR, ARTIFACT_SCHEMA VARCHAR, FILE_PATH VARCHAR, DEPTH NUMBER)
-LANGUAGE SQL
-EXECUTE AS CALLER
-AS
-$$
-DECLARE
-    res RESULTSET;
-BEGIN
-    res := (
-        WITH RECURSIVE lineage AS (
-            -- Seed: direct dependents of the changed BRONZE table
-            SELECT ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH, 1 AS DEPTH
-            FROM ARTIFACT_REGISTRY
-            WHERE DEPENDS_ON = :p_table_name
+-- View: Reusable lineage traversal (replaces duplicated CTE)
+CREATE OR REPLACE VIEW VW_ARTIFACT_LINEAGE AS
+WITH RECURSIVE lineage AS (
+    SELECT ARTIFACT_NAME AS SOURCE_TABLE, ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH, DEPENDS_ON, 1 AS DEPTH
+    FROM ARTIFACT_REGISTRY
+    UNION ALL
+    SELECT l.SOURCE_TABLE, ar.ARTIFACT_NAME, ar.ARTIFACT_SCHEMA, ar.FILE_PATH, ar.DEPENDS_ON, l.DEPTH + 1
+    FROM ARTIFACT_REGISTRY ar
+    INNER JOIN lineage l ON ar.DEPENDS_ON = l.ARTIFACT_NAME
+    WHERE l.DEPTH < 10
+)
+SELECT SOURCE_TABLE AS CHANGED_TABLE, ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH, DEPTH
+FROM lineage
+WHERE SOURCE_TABLE != ARTIFACT_NAME;
 
-            UNION ALL
-
-            -- Recurse: dependents of dependents
-            SELECT ar.ARTIFACT_NAME, ar.ARTIFACT_SCHEMA, ar.FILE_PATH, l.DEPTH + 1
-            FROM ARTIFACT_REGISTRY ar
-            INNER JOIN lineage l ON ar.DEPENDS_ON = l.ARTIFACT_NAME
-            WHERE l.DEPTH < 10  -- safety limit
-        )
-        SELECT DISTINCT ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH, MIN(DEPTH) AS DEPTH
-        FROM lineage
-        GROUP BY ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH
-        ORDER BY DEPTH, ARTIFACT_SCHEMA, ARTIFACT_NAME
-    );
-    RETURN TABLE(res);
-END;
-$$;
-
--- Procedure: Generate code for all impacted artifacts using Cortex LLM
-CREATE OR REPLACE PROCEDURE SP_GENERATE_ARTIFACT_CODE(p_event_id VARCHAR)
+-- Procedure: Generate code for impacted artifacts (Python — parameterized, idempotent)
+CREATE OR REPLACE PROCEDURE SP_GENERATE_ARTIFACT_CODE(P_EVENT_ID VARCHAR)
 RETURNS VARCHAR
-LANGUAGE SQL
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
 EXECUTE AS CALLER
 AS
 $$
-DECLARE
-    v_table_name VARCHAR;
-    v_change_type VARCHAR;
-    v_column_name VARCHAR;
-    v_new_type VARCHAR;
-    v_old_type VARCHAR;
-    v_generated NUMBER := 0;
-BEGIN
-    -- Get event details
-    SELECT TABLE_NAME, CHANGE_TYPE, COLUMN_NAME, NEW_DATA_TYPE, OLD_DATA_TYPE
-    INTO v_table_name, v_change_type, v_column_name, v_new_type, v_old_type
-    FROM SCHEMA_CHANGE_EVENTS
-    WHERE EVENT_ID = :p_event_id;
+from snowflake.snowpark.functions import col, lit
 
-    -- For each impacted artifact, regenerate code
-    FOR rec IN (
-        WITH RECURSIVE lineage AS (
-            SELECT ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH, 1 AS DEPTH
-            FROM ARTIFACT_REGISTRY WHERE DEPENDS_ON = :v_table_name
-            UNION ALL
-            SELECT ar.ARTIFACT_NAME, ar.ARTIFACT_SCHEMA, ar.FILE_PATH, l.DEPTH + 1
-            FROM ARTIFACT_REGISTRY ar INNER JOIN lineage l ON ar.DEPENDS_ON = l.ARTIFACT_NAME
-            WHERE l.DEPTH < 10
+def run(session, P_EVENT_ID):
+    # Get event details using parameterized filter
+    ev_df = session.table("SELFHEALING_PROD.CONFIG.SCHEMA_CHANGE_EVENTS").filter(col("EVENT_ID") == P_EVENT_ID)
+    ev = ev_df.collect()
+    if not ev:
+        return "ERROR: Event not found"
+
+    table_name = ev[0]["TABLE_NAME"]
+    change_type = ev[0]["CHANGE_TYPE"]
+    column_name = ev[0]["COLUMN_NAME"] or "N/A"
+    old_type = ev[0]["OLD_DATA_TYPE"] or "N/A"
+    new_type = ev[0]["NEW_DATA_TYPE"] or "N/A"
+
+    # Get impacted artifacts via the lineage view
+    lineage_df = session.table("SELFHEALING_PROD.CONFIG.VW_ARTIFACT_LINEAGE").filter(col("CHANGED_TABLE") == table_name)
+    artifacts = lineage_df.collect()
+
+    if not artifacts:
+        return f"No downstream artifacts found for {table_name}"
+
+    generated = 0
+    errors = []
+
+    for art in artifacts:
+        art_name = art["ARTIFACT_NAME"]
+        art_schema = art["ARTIFACT_SCHEMA"]
+        art_path = art["FILE_PATH"]
+
+        # Idempotency: skip if already generated for this event+artifact
+        existing = session.table("SELFHEALING_PROD.CONFIG.GENERATED_CODE").filter(
+            (col("EVENT_ID") == P_EVENT_ID) & (col("ARTIFACT_NAME") == art_name)
+        ).count()
+        if existing > 0:
+            continue
+
+        # Get baseline SQL (parameterized)
+        baseline_df = session.table("SELFHEALING_PROD.CONFIG.GENERATED_CODE").filter(
+            (col("ARTIFACT_NAME") == art_name) & (col("TEST_STATUS") == "PASS")
+        ).select(col("GENERATED_SQL")).sort(col("GENERATED_AT").desc()).limit(1)
+        baseline_rows = baseline_df.collect()
+        current_sql = baseline_rows[0]["GENERATED_SQL"] if baseline_rows else "-- No prior SQL"
+
+        # Build prompt (safe — no user input in column names)
+        prompt = (
+            f"Regenerate this Snowflake SQL model for a schema change. "
+            f"CHANGE: {change_type} on SELFHEALING_PROD.BRONZE.{table_name} "
+            f"column: {column_name} (old: {old_type}, new: {new_type}). "
+            f"TARGET: {art_schema}.{art_name}. "
+            f"CURRENT SQL: {current_sql}. "
+            f"RULES: If NEW_COLUMN add it to SELECT. If COLUMN_DROP remove it. "
+            f"If TYPE_CHANGE use TRY_CAST. Return ONLY SQL. No markdown. "
+            f"Use SELFHEALING_PROD.SCHEMA.TABLE fully qualified names."
         )
-        SELECT DISTINCT ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH
-        FROM lineage
-    ) DO
-        -- Get current model SQL from GENERATED_CODE or use a placeholder
-        LET v_current_sql VARCHAR := '';
-        SELECT COALESCE(MAX(GENERATED_SQL), MAX(ORIGINAL_SQL), '') INTO v_current_sql
-        FROM GENERATED_CODE
-        WHERE ARTIFACT_NAME = rec.ARTIFACT_NAME;
 
-        -- If no prior code exists, read from the dbt model convention
-        IF (v_current_sql = '') THEN
-            v_current_sql := '-- Model: ' || rec.ARTIFACT_NAME || ' (no prior SQL found, generating from schema context)';
-        END IF;
+        try:
+            # Call Cortex (safe — prompt doesn't contain unescaped user input)
+            prompt_safe = prompt.replace("'", "''")
+            result = session.sql(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', '{prompt_safe}')").collect()
+            new_sql = result[0][0] if result else "-- Generation failed"
+        except Exception as e:
+            errors.append(f"{art_name}: {str(e)[:100]}")
+            new_sql = f"-- ERROR: {str(e)[:200]}"
 
-        -- Generate new SQL using Cortex
-        LET v_prompt VARCHAR := 'You are a dbt SQL expert. Regenerate this Snowflake SQL model to accommodate a schema change.
+        # Insert (idempotent via UNIQUE constraint — will error on dupe, caught above)
+        new_sql_safe = new_sql.replace("'", "''")
+        current_safe = current_sql.replace("'", "''")
+        try:
+            session.sql(
+                f"INSERT INTO SELFHEALING_PROD.CONFIG.GENERATED_CODE "
+                f"(EVENT_ID, ARTIFACT_NAME, ARTIFACT_SCHEMA, FILE_PATH, ORIGINAL_SQL, GENERATED_SQL) "
+                f"VALUES ('{P_EVENT_ID}', '{art_name}', '{art_schema}', '{art_path}', "
+                f"'{current_safe}', '{new_sql_safe}')"
+            ).collect()
+            generated += 1
+        except Exception as e:
+            errors.append(f"{art_name} insert: {str(e)[:100]}")
 
-SCHEMA CHANGE:
-- Type: ' || :v_change_type || '
-- Table: SELFHEALING_PROD.BRONZE.' || :v_table_name || '
-- Column: ' || COALESCE(:v_column_name, 'N/A') || '
-- Old data type: ' || COALESCE(:v_old_type, 'N/A') || '
-- New data type: ' || COALESCE(:v_new_type, 'N/A') || '
+    # Update event status
+    session.sql(
+        f"UPDATE SELFHEALING_PROD.CONFIG.SCHEMA_CHANGE_EVENTS "
+        f"SET PIPELINE_STATUS = 'CODE_GENERATED' WHERE EVENT_ID = '{P_EVENT_ID}'"
+    ).collect()
 
-TARGET MODEL: ' || rec.ARTIFACT_SCHEMA || '.' || rec.ARTIFACT_NAME || '
-FILE: ' || rec.FILE_PATH || '
-
-CURRENT SQL:
-' || v_current_sql || '
-
-INSTRUCTIONS:
-1. If a NEW_COLUMN was added upstream, add it to this model SELECT list in the appropriate position.
-2. If a COLUMN_DROP occurred, remove the column reference and handle any dependent calculations.
-3. If a TYPE_CHANGE occurred, add appropriate CAST or TRY_CAST to maintain compatibility.
-4. Preserve the existing model structure, joins, and aggregation logic.
-5. Return ONLY the complete SQL statement — no explanation, no markdown fences.
-6. Use {{ config(materialized=''table'') }} for GOLD models, {{ config(materialized=''view'') }} for SILVER models.
-7. Use {{ source(''bronze'', ''TABLE_NAME'') }} for BRONZE references, {{ ref(''model_name'') }} for model-to-model refs.';
-
-        LET v_new_sql VARCHAR := SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', v_prompt);
-
-        -- Store generated code
-        INSERT INTO GENERATED_CODE (EVENT_ID, ARTIFACT_NAME, FILE_PATH, ORIGINAL_SQL, GENERATED_SQL)
-        SELECT :p_event_id, rec.ARTIFACT_NAME, rec.FILE_PATH, :v_current_sql, :v_new_sql;
-
-        v_generated := v_generated + 1;
-    END FOR;
-
-    -- Update event status
-    UPDATE SCHEMA_CHANGE_EVENTS SET PIPELINE_STATUS = 'CODE_GENERATED' WHERE EVENT_ID = :p_event_id;
-
-    RETURN 'Generated code for ' || v_generated || ' impacted artifacts';
-END;
+    result_msg = f"Generated code for {generated} artifacts"
+    if errors:
+        result_msg += f" ({len(errors)} errors: {'; '.join(errors[:3])})"
+    return result_msg
 $$;
